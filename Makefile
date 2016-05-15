@@ -1,5 +1,5 @@
-packagesocket.so: lpackagesocket.c PackageSocket.cpp
-	g++ -g -o2 -Wall -llua --shared -std=c++11 -o $@ $^
+packagesocket.so: lpackagesocket.c 
+	gcc -g -o2 -Wall -llua --shared -std=c99 -o $@ $^
 
 
 .PHONY: clean
