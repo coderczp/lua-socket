@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <sys/timeb.h>
 #include <netdb.h>
+#include <sys/select.h>
 #endif
 
 #include <stdlib.h>
@@ -108,12 +109,11 @@ write_buffer_free(struct write_buffer *wb) {
 
 static inline void
 free_wb_list(struct wb_list *list) {
-	struct write_buffer *tmp = list->head;
-	list->head = list->head->next;
-	while (tmp) {
+	struct write_buffer *first = list->head;
+	while (first) {
+		struct write_buffer *tmp = first;
+		first = first->next;
 		write_buffer_free(tmp);
-		struct write_buffer *tmp = list->head;
-		list->head = list->head->next;
 	}
 }
 
@@ -129,26 +129,25 @@ typedef struct lua_socket {
 	uint16_t        protocol;
 	uint16_t        type;
 	char            ping[2];
+	int             header;
 	struct wb_list *wl;
 	struct sockaddr local;
 	struct sockaddr remote;
 	char            buffer[1024];
 	int len;
-	char           *recvbuf;
-	int             len;
-	int             recved;
-	int             header;
+	char           *bhead;
+	char           *btail;
 } lua_socket;
 
 typedef struct lua_gate
 {
-	struct fd_set      fds;
+	fd_set             fds;
 	struct lua_socket *head;
 	struct lua_socket *tail;
-};
+} lua_gate;
 
 
-static void 
+static int  
 colse_sock(struct lua_gate *g, struct lua_socket *so) {
 	struct lua_socket *ptr = g->head;
 	while (ptr) {
@@ -159,16 +158,14 @@ colse_sock(struct lua_gate *g, struct lua_socket *so) {
 			g->head = ptr;
 		}
 	}
-	if (so->recvbuf) {
-		FREE(so->recvbuf);
-	}
-	free_wb_list(so->wb);
+	free_wb_list(so->wl);
 #if WIN32
-	closesocket(so->socket);
+	closesocket(so->fd);
 #else
-	close(so->socket);
+	close(so->fd);
 #endif // WIN32
 	FREE(so);
+	return 1;
 }
 
 static int
@@ -207,8 +204,8 @@ lsocket(lua_State *L) {
 		const char *laddr = luaL_checklstring(L, 5, &sz);
 		int lport = luaL_checkinteger(L, 6);
 		struct sockaddr_in6 *local = (struct sockaddr_in6 *)&so->local;
-		(local)->sin_family = AF_INET6;
-		(local)->sin_port = htons(lport);	
+		(local)->sin6_family = AF_INET6;
+		(local)->sin6_port = htons(lport);	
 		inet_pton(AF_INET6, laddr, &local->sin6_addr);
 	}
 	so->wl = (struct wb_list *)MALLOC(sizeof(*so->wl));
@@ -217,6 +214,8 @@ lsocket(lua_State *L) {
 	so->ping[1] = 0;
 	memset(so->buffer, 0, 1024);
 	so->len = 1024;
+	so->bhead = so->buffer;
+	so->btail = so->buffer;
 	so->next = NULL;
 	g->tail->next = so;
 	g->tail = so;
@@ -229,35 +228,35 @@ lsocket(lua_State *L) {
 
 static int
 lconnect(lua_State *L) {
-	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	// struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
 	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
 	size_t sz;
 	const char *addr = luaL_checklstring(L, 3, &sz);
 	uint16_t port = luaL_checkinteger(L, 4);
 	if (so->protocol == PROTOCOL_TCP) {
-		struct sockaddr_in * r = (struct sockaddr_in *)&so->remote;
-		r->sin_family = AF_INET;
-		r->sin_port = htons(port);	
-		inet_pton(AF_INET, addr, &r->sin_addr);
-		int r = connect(so->fd, (const struct sockaddr*)&so->remote, sizeof(so->remote));
-		if (r == -1) {
+		struct sockaddr_in * remote = (struct sockaddr_in *)&so->remote;
+		remote->sin_family = AF_INET;
+		remote->sin_port = htons(port);	
+		inet_pton(AF_INET, addr, &remote->sin_addr);
+		int res = connect(so->fd, (const struct sockaddr*)&so->remote, sizeof(so->remote));
+		if (res == -1) {
 	#if WIN32
-			closesocket(so->socket);
+			closesocket(so->fd);
 	#else
-			close(so->socket);
+			close(so->fd);
 	#endif
 			goto _failed;
 		}
 	} else if (so->protocol == PROTOCOL_UDP) {
-		struct sockaddr_in *r = (struct sockaddr_in *)&so->remote;
-		r->sin_family = AF_INET;
-		r->sin_port = htons(port);
-		inet_pton(AF_INET, addr, &r->sin_addr);
+		struct sockaddr_in *remote = (struct sockaddr_in *)&so->remote;
+		remote->sin_family = AF_INET;
+		remote->sin_port = htons(port);
+		inet_pton(AF_INET, addr, &remote->sin_addr);
 	} else if (so->protocol == PROTOCOL_UDPv6) {
-		struct sockaddr_in6 *r = (struct sockaddr_in6 *)&so->remote;
-		r->sin_family = AF_INET6;
-		r->sin_port = htons(port);	
-		inet_pton(AF_INET6, addr, &r->sin6_addr);
+		struct sockaddr_in6 *remote = (struct sockaddr_in6 *)&so->remote;
+		remote->sin6_family = AF_INET6;
+		remote->sin6_port = htons(port);	
+		inet_pton(AF_INET6, addr, &remote->sin6_addr);
 	}
 	lua_pushinteger(L, SOCKET_OPEN);
 	return 1;
@@ -276,11 +275,10 @@ send_list(struct lua_socket *so, struct wb_list *list) {
 				#if WIN32 
 				int e = WSAGetLastError();
 				#else
-				if (errno == EINTR || errno == AGAIN_WOULDBLOCK) {
-
-				} else {
-					return SOCKET_ERROR;
-				}
+				// if (errno == EINTR || errno == AGAIN_WOULDBLOCK) {
+				// } else {
+				// 	return SOCKET_ERROR;
+				// }
 				#endif
 			} else {
 				if (sz != tmp->sz) {
@@ -327,13 +325,13 @@ static int
 append_sendbuffer(struct lua_socket * so, struct write_buffer *wb) {
 	so->wl->tail->next = wb;
 	wb->next = NULL;
-	s->wl->tail = wb;
+	so->wl->tail = wb;
 	return 1;
 }
 
 static int
 lsend(lua_State *L) {
-	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	// struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
 	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
 	assert(so->header == HEADER_PG);
 	size_t sz;
@@ -356,12 +354,13 @@ lsend(lua_State *L) {
 
 static int 
 lsendline(lua_State *L) {
-	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	// struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
 	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
 	assert(so->header == HEADER_LINE);
 	size_t sz;
 	const char *addr = luaL_checklstring(L, 3, &sz);
 	char *buffer = (char *)MALLOC(sz + 1);
+	memcpy(buffer, addr, sz);
 	buffer[sz] = '\n';
 	struct write_buffer *wb = (struct write_buffer *)MALLOC(sizeof(*wb));
 	wb->buffer = buffer;
@@ -375,6 +374,47 @@ lsendline(lua_State *L) {
 	return 1;	
 }
 
+static int 
+readc(lua_State *L, struct lua_gate *g, struct lua_socket *so) {
+	if (so->bhead == so->btail) {
+		return 1;
+	}
+	if (so->header == HEADER_PG) {
+		int h = so->buffer[0];
+		h = h & so->buffer[1] << 8;
+		if (so->btail - so->bhead >= h+ 2) {
+			lua_pushlightuserdata(L, so);		
+			lua_pushlstring(L, so->bhead+2, h);
+			lua_rawset(L, -3);
+			so->bhead = so->bhead + h + 2;
+		}
+	} else if (so->header == HEADER_LINE) {
+		char *p = so->bhead;
+		while (p != so->btail) {
+			if ((*p) == '\n') {
+				lua_pushlightuserdata(L, so);
+				lua_pushlstring(L, so->bhead, p - so->bhead);
+				lua_rawset(L, -3);
+				so->bhead = p + 1;
+			} else {
+				p++;
+			}
+		}
+	}
+	return 1;
+}
+
+static int 
+rebase(lua_State *L, struct lua_gate *g, struct lua_socket *so) {
+	if (so->len - (so->buffer - so->btail) <= 40) {
+		int count = so->bhead - so->btail;
+		memmove(so->buffer, so->bhead, count);
+		so->bhead = so->buffer;
+		so->btail = so->buffer + count;
+	}
+	return 1;
+}
+
 static int
 lpoll(lua_State *L) {
 	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
@@ -384,7 +424,7 @@ lpoll(lua_State *L) {
 	struct lua_socket *ptr = g->head;
 	while (ptr) {
 		if (ptr->fd > max) 
-			max = head->fd;
+			max = ptr->fd;
 		FD_SET(ptr->fd, &g->fds);
 		ptr = ptr->next;
 	}
@@ -397,29 +437,32 @@ lpoll(lua_State *L) {
 		while (ptr) {
 			send_list(ptr, ptr->wl);		
 			if (FD_ISSET(ptr->fd, &g->fds)) {
+				rebase(L, g, ptr);
 				if (ptr->protocol == PROTOCOL_TCP) {
-					int res = recv(ptr->fd, ptr->buffer, ptr->len, 0);
+					int res = recv(ptr->fd, ptr->btail, ptr->len - (ptr->btail - ptr->buffer + 1), 0);
 					if (res == -1) {
 						// error
 					} else if (res == 0) {
 						// 
-						colse_sock(ptr);
+						colse_sock(g, ptr);
 					} else if (res > 0) {
-						if (ptr->header == HEADER_PG) {
-							int h = ptr->buffer[0];
-							char *buffer = (char *)malloc(h);
-							if (res - 2 == h) {
-
-							}
-						}	
-						lua_pushlightuserdata(L, ptr);
-						lua_pushstring(L, buffer);
-						lua_rawset(L, -3);
+						ptr->btail = ptr->btail + res;
+						readc(L, g, ptr);
 					}
 				} else if (ptr->protocol == PROTOCOL_UDP) {
-					int res = recvfrom(ptr->fd, ptr->buffer, ptr->len, 0, &ptr->remote, sizeof(ptr->remote));
+					socklen_t len = sizeof(ptr->remote);
+					int res = recvfrom(ptr->fd, ptr->btail, ptr->len - (ptr->btail - ptr->buffer + 1), 0, &ptr->remote, &len);
+					if (res > 0) {
+						ptr->btail = ptr->btail + res;
+						readc(L, g, ptr);
+					}
 				} else if (ptr->protocol == PROTOCOL_UDPv6) {
-					int res = recvfrom(ptr->fd, ptr->buffer, ptr->len, 0, &ptr->remote, sizeof(ptr->remote));
+					socklen_t len = sizeof(ptr->remote);
+					int res = recvfrom(ptr->fd, ptr->btail, ptr->len - (ptr->btail - ptr->buffer + 1), 0, &ptr->remote, &len);
+					if (res > 0) {
+						ptr->btail = ptr->btail + res;
+						readc(L, g, ptr);
+					}
 				}
 			}
 			ptr = ptr->next;
@@ -430,46 +473,50 @@ lpoll(lua_State *L) {
 	return 2;
 }
 
-
-
 static int
 lclosesocket(lua_State *L) {
 	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
 	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
-	int res = colse_sock(g, so);
+	colse_sock(g, so);
 	lua_pushinteger(L, SOCKET_EXIT);
 	return 1;
 }
 
 static int
 lkeepalive(lua_State *L) {
-	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
-	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
+	// struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	// struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
 	//setsockopt(so->so)
 	return 0;
 }
 
 static int 
 lclose(lua_State *L) {
-	close_lib()
+	close_lib();
 	lua_pushinteger(L, SOCKET_EXIT);
 	return 1;
 }
 
 int
 luaopen_packagesocket(lua_State *L) {
+	luaL_checkversion(L);
 	luaL_Reg l[] = {
 		{ "new", lnew },
 		{ "socket", lsocket },
 		{ "connect", lconnect },
 		{ "send", lsend },
+		{ "sendline", lsendline},
 		{ "poll", lpoll },
 		{ "closesocket", lclosesocket},
 		{ "close", lclose },
 		{ "keepalive", lkeepalive },
 		{ NULL, NULL },
 	};
+#if LUA_VERSION_NUM < 503
 	luaL_openlib(L, "packagesocket", l, 0);
+#else
+	luaL_newlib(L, l);
+#endif
 	lua_pushstring(L, "SOCKET_DATA");
 	lua_pushinteger(L, SOCKET_DATA);
 	lua_rawset(L, -3);
@@ -506,7 +553,7 @@ luaopen_packagesocket(lua_State *L) {
 	lua_setfield(L, -2, "PROTOCOL_TCP");
 	lua_pushinteger(L, PROTOCOL_UDP);
 	lua_setfield(L, -2, "PROTOCOL_UDP");
-	lua_pushinteger(L, -2, PROTOCOL_UDPv6);
+	lua_pushinteger(L, PROTOCOL_UDPv6);
 	lua_setfield(L, -2, "PROTOCOL_UDPv6");
 	return 1;
 }

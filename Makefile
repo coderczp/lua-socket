@@ -1,6 +1,5 @@
 packagesocket.so: lpackagesocket.c 
-	gcc -g -o2 -Wall -llua --shared -std=c99 -o $@ $^
-
+	gcc -g -o2 -Wall --shared -std=c99 -I./../lua/src -llua -o $@ $^
 
 .PHONY: clean
 
