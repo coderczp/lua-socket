@@ -4,7 +4,6 @@
 #include <ws2tcpip.h>
 #include <Windows.h>
 //#pragma comment (lib, "Ws2_32.lib")
-
 #else
 #include <sys/stat.h>
 #include <netinet/in.h>
@@ -15,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/timeb.h>
+#include <netdb.h>
 #endif
 
 #include <stdlib.h>
@@ -50,14 +50,18 @@
 #define PROTOCOL_UDP 1
 #define PROTOCOL_UDPv6 2
 
+#define HEADER_LINE 0
+#define HEADER_PG 1
+
 #define UDP_ADDRESS_SIZE 19	// ipv6 128bit + port 16bit + 1 byte type
 
 #define MALLOC malloc
 #define FREE   free
 
+#define COMPAT_LUA
 
-static int 
-init_lib(lua_State *L) {
+static void
+init_lib() {
 #if WIN32
 	WSADATA wsaData;
 	int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -66,15 +70,13 @@ init_lib(lua_State *L) {
 		luaL_error(L, "init win32 failture.");
 	}
 #endif // WIN32
-	return 1;
 }
 
-static int
-close_lib(lua_State *L) {
+static void
+close_lib() {
 #if WIN32
 	WSACleanup();
 #endif // WIN32
-	return 1;
 }
 
 struct write_buffer {
@@ -122,51 +124,140 @@ clear_wb_list(struct wb_list *list) {
 }
 
 typedef struct lua_socket {
-	struct fd_set   fds;
-	uint32_t        socket;
-	char            host[32];
-	uint16_t        port;
+	struct lua_socket *next;
+	uint32_t        fd;
 	uint16_t        protocol;
 	uint16_t        type;
 	char            ping[2];
 	struct wb_list *wl;
+	struct sockaddr local;
+	struct sockaddr remote;
+	char            buffer[1024];
+	int len;
+	char           *recvbuf;
+	int             len;
+	int             recved;
+	int             header;
 } lua_socket;
+
+typedef struct lua_gate
+{
+	struct fd_set      fds;
+	struct lua_socket *head;
+	struct lua_socket *tail;
+};
+
+
+static void 
+colse_sock(struct lua_gate *g, struct lua_socket *so) {
+	struct lua_socket *ptr = g->head;
+	while (ptr) {
+		if (ptr == so) {
+			ptr = ptr->next;
+		}
+		if (g->head == so) {
+			g->head = ptr;
+		}
+	}
+	if (so->recvbuf) {
+		FREE(so->recvbuf);
+	}
+	free_wb_list(so->wb);
+#if WIN32
+	closesocket(so->socket);
+#else
+	close(so->socket);
+#endif // WIN32
+	FREE(so);
+}
 
 static int
 lnew(lua_State *L) {
-	init_lib(L);
-	struct lua_socket *so = (struct lua_socket*)malloc(sizeof(*so));
-	so->protocol = PROTOCOL_TCP;
-	so->type = SOCKET_TYPE_RESERVE;
-	so->socket = socket(AF_INET, SOCK_STREAM, 0);
-	so->wl = malloc(sizeof(*so->wl));
+	init_lib();
+	struct lua_gate *g = (struct lua_gate *)MALLOC(sizeof(*g));
+	g->head = NULL;
+	g->tail = NULL;
+	lua_pushlightuserdata(L, g);
+	return 1;
+}
+
+static int
+lsocket(lua_State *L) {
+	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	struct lua_socket *so = (struct lua_socket*)MALLOC(sizeof(*so));
+	so->protocol = luaL_checkinteger(L, 2);
+	so->type = luaL_checkinteger(L, 3);
+	so->header = luaL_checkinteger(L, 4);
+	if (so->protocol == PROTOCOL_TCP) {
+		so->fd = socket(AF_INET, SOCK_STREAM, 0);
+	} else if (so->protocol == PROTOCOL_UDP) {
+		so->fd = socket(AF_INET, SOCK_DGRAM, 0);
+		// addrinfo
+		// getaddrinfo
+		size_t sz = 0;
+		const char *laddr = luaL_checklstring(L, 5, &sz);
+		int lport = luaL_checkinteger(L, 6);	
+		struct sockaddr_in * local = (struct sockaddr_in *)&so->local;
+		(local)->sin_family = AF_INET;
+		(local)->sin_port = htons(lport);	
+		inet_pton(AF_INET, laddr, &local->sin_addr);
+	} else if (so->protocol == PROTOCOL_UDPv6) {
+		so->fd = socket(AF_INET6, SOCK_DGRAM, 0);
+		size_t sz = 0;
+		const char *laddr = luaL_checklstring(L, 5, &sz);
+		int lport = luaL_checkinteger(L, 6);
+		struct sockaddr_in6 *local = (struct sockaddr_in6 *)&so->local;
+		(local)->sin_family = AF_INET6;
+		(local)->sin_port = htons(lport);	
+		inet_pton(AF_INET6, laddr, &local->sin6_addr);
+	}
+	so->wl = (struct wb_list *)MALLOC(sizeof(*so->wl));
 	clear_wb_list(so->wl);
+	so->ping[0] = 0;
+	so->ping[1] = 0;
+	memset(so->buffer, 0, 1024);
+	so->len = 1024;
+	so->next = NULL;
+	g->tail->next = so;
+	g->tail = so;
+	if (g->head == NULL) {
+		g->head = so;
+	}
 	lua_pushlightuserdata(L, so);
 	return 1;
 }
 
 static int
 lconnect(lua_State *L) {
-	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 1);
+	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
 	size_t sz;
-	const char *addr = luaL_checklstring(L, 2, &sz);
-	uint16_t port = luaL_checkinteger(L, 3);
-	memcpy(so->host, addr, sz);
-	so->port = port;
-
-	struct sockaddr_in sa;
-	memset(&sa, 0, sizeof(sa));
-	sa.sin_family = AF_INET;
-	sa.sin_port = htons(port);
-	sa.sin_addr.s_addr = inet_addr(addr);
-	int r = connect(so->socket, (const struct sockaddr*)&sa, sizeof(sa));
-	if (r == -1) {
-#if WIN32
-		closesocket(so->socket);
-#else
-		close(so->socket);
-#endif
-		goto _failed;
+	const char *addr = luaL_checklstring(L, 3, &sz);
+	uint16_t port = luaL_checkinteger(L, 4);
+	if (so->protocol == PROTOCOL_TCP) {
+		struct sockaddr_in * r = (struct sockaddr_in *)&so->remote;
+		r->sin_family = AF_INET;
+		r->sin_port = htons(port);	
+		inet_pton(AF_INET, addr, &r->sin_addr);
+		int r = connect(so->fd, (const struct sockaddr*)&so->remote, sizeof(so->remote));
+		if (r == -1) {
+	#if WIN32
+			closesocket(so->socket);
+	#else
+			close(so->socket);
+	#endif
+			goto _failed;
+		}
+	} else if (so->protocol == PROTOCOL_UDP) {
+		struct sockaddr_in *r = (struct sockaddr_in *)&so->remote;
+		r->sin_family = AF_INET;
+		r->sin_port = htons(port);
+		inet_pton(AF_INET, addr, &r->sin_addr);
+	} else if (so->protocol == PROTOCOL_UDPv6) {
+		struct sockaddr_in6 *r = (struct sockaddr_in6 *)&so->remote;
+		r->sin_family = AF_INET6;
+		r->sin_port = htons(port);	
+		inet_pton(AF_INET6, addr, &r->sin6_addr);
 	}
 	lua_pushinteger(L, SOCKET_OPEN);
 	return 1;
@@ -176,41 +267,65 @@ _failed:
 }
 
 static int
-send_list_tcp(struct lua_socket * s, struct wb_list *list) {
-	if (list->head) {
-		struct write_buffer * tmp = list->head;
-		int sz = send(s->socket, tmp->ptr, tmp->sz, 0);
-		if (sz < 0) {
-			int werrno = 0;
-#if WIN32
-			werrno = WSAGetLastError();
-#else
-			switch (errno) {
-			case EINTR:
-				return
-			case AGAIN_WOULDBLOCK:
-				return -1;
-			}
-#endif // WIN32
-		} else {
-			if (sz != tmp->sz) {
-				tmp->ptr += sz;
-				tmp->sz -= sz;
-			} else {
-				if (list->tail == tmp) {
-					list->tail = NULL;
+send_list(struct lua_socket *so, struct wb_list *list) {
+	struct write_buffer *tmp = list->head;
+	if (tmp) {
+		if (so->protocol == PROTOCOL_TCP) {
+			int sz = send(so->fd, tmp->ptr, tmp->sz, 0);
+			if (sz == -1) {
+				#if WIN32 
+				int e = WSAGetLastError();
+				#else
+				if (errno == EINTR || errno == AGAIN_WOULDBLOCK) {
+
+				} else {
+					return SOCKET_ERROR;
 				}
-				list->head = tmp->next;
-				write_buffer_free(tmp);
+				#endif
+			} else {
+				if (sz != tmp->sz) {
+					tmp->ptr += sz;
+					tmp->sz -= sz;
+				} else {
+					list->head = tmp->next;
+					write_buffer_free(tmp);
+				}
+			}
+		} else if (so->protocol == PROTOCOL_UDP) {
+			int sz = sendto(so->fd, tmp->ptr, tmp->sz, 0, &so->remote, sizeof(so->remote));
+			if (sz == -1) {
+
+			} else {
+				if (sz != tmp->sz) {
+					tmp->ptr += sz;
+					tmp->sz -= sz;
+				} else {
+					list->head = tmp->next;
+					write_buffer_free(tmp);
+				}	
+			}
+		} else if (so->protocol == PROTOCOL_UDPv6) {
+			int sz = sendto(so->fd, tmp->ptr, tmp->sz, 0, &so->remote, sizeof(so->remote));
+			if (sz == -1) {
+
+			} else {
+				if (sz != tmp->sz) {
+					tmp->ptr += sz;
+					tmp->sz -= sz;
+				} else {
+					list->head = tmp->next;
+					write_buffer_free(tmp);
+				}	
 			}
 		}
+	} else {
 	}
 	return SOCKET_DATA;
 }
 
 static int
-append_sendbuffer(struct lua_socket * s, struct write_buffer *wb) {
-	s->wl->tail->next = wb;
+append_sendbuffer(struct lua_socket * so, struct write_buffer *wb) {
+	so->wl->tail->next = wb;
 	wb->next = NULL;
 	s->wl->tail = wb;
 	return 1;
@@ -218,309 +333,140 @@ append_sendbuffer(struct lua_socket * s, struct write_buffer *wb) {
 
 static int
 lsend(lua_State *L) {
-	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 1);
+	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
+	assert(so->header == HEADER_PG);
 	size_t sz;
-	const char *addr = luaL_checklstring(L, 2, &sz);
+	const char *addr = luaL_checklstring(L, 3, &sz);
+	char *buffer = (char *)MALLOC(sz + 2);
+	buffer[0] = sz & 0xff;
+	buffer[1] = (sz >> 8) & 0xff;
+	memcpy(buffer+2, addr, sz);
 	struct write_buffer *wb = (struct write_buffer *)MALLOC(sizeof(*wb));
-	wb->buffer = (void*)addr;
-	wb->ptr = (char*)addr;
-	wb->sz = sz;
+	wb->buffer = buffer;
+	wb->ptr = buffer;
+	wb->sz = sz + 2;
+	wb->next = NULL;
+	wb->userobject = false;
 	append_sendbuffer(so, wb);
-	if (so->protocol == PROTOCOL_TCP) {
-		int r = send_list_tcp(so, so->wl);
-		lua_pushinteger(L, r);
-		return 1;
-	} else {
-		lua_pushinteger(L, SOCKET_ERROR);
-	}
+	int r = send_list(so, so->wl);
+	lua_pushinteger(L, r);
 	return 1;
+}
+
+static int 
+lsendline(lua_State *L) {
+	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
+	assert(so->header == HEADER_LINE);
+	size_t sz;
+	const char *addr = luaL_checklstring(L, 3, &sz);
+	char *buffer = (char *)MALLOC(sz + 1);
+	buffer[sz] = '\n';
+	struct write_buffer *wb = (struct write_buffer *)MALLOC(sizeof(*wb));
+	wb->buffer = buffer;
+	wb->ptr = buffer;
+	wb->sz = sz + 2;
+	wb->next = NULL;
+	wb->userobject = false;
+	append_sendbuffer(so, wb);
+	int r = send_list(so, so->wl);
+	lua_pushinteger(L, r);
+	return 1;	
 }
 
 static int
 lpoll(lua_State *L) {
-	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 1);
-	send_list_tcp(so, so->wl);
-	FD_ZERO(&so->fds);
-	FD_SET(so->socket, &so->fds);
+	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	lua_newtable(L);
+	FD_ZERO(&g->fds);
+	int max = 0;
+	struct lua_socket *ptr = g->head;
+	while (ptr) {
+		if (ptr->fd > max) 
+			max = head->fd;
+		FD_SET(ptr->fd, &g->fds);
+		ptr = ptr->next;
+	}
 	struct timeval timeout;
 	timeout.tv_sec = 0;
 	timeout.tv_usec = 0;
-	int r = select(so->socket + 1, &so->fds, NULL, NULL, &timeout);
+	int r = select(max + 1, &g->fds, NULL, NULL, &timeout);
 	if (r > 0) {
-		if (FD_ISSET(so->socket, &so->fds)) {
-			char tmp[512] = { 0 };
-			int r = recv(so->socket, (char *)tmp, 512, 0);
-			if (r == -1) {
+		ptr = g->head;
+		while (ptr) {
+			send_list(ptr, ptr->wl);		
+			if (FD_ISSET(ptr->fd, &g->fds)) {
+				if (ptr->protocol == PROTOCOL_TCP) {
+					int res = recv(ptr->fd, ptr->buffer, ptr->len, 0);
+					if (res == -1) {
+						// error
+					} else if (res == 0) {
+						// 
+						colse_sock(ptr);
+					} else if (res > 0) {
+						if (ptr->header == HEADER_PG) {
+							int h = ptr->buffer[0];
+							char *buffer = (char *)malloc(h);
+							if (res - 2 == h) {
 
-			} else if (r == 0) {
-#if WIN32
-				closesocket(so->socket);
-#else
-				close(so->socket);
-#endif // WIN32
-				free_wb_list(so->wl);
-				FREE(so);
-				close_lib(L);
-				lua_pushinteger(L, SOCKET_EXIT);
-				return 1;
-			} else if (r > 0) {
-				lua_pushinteger(L, SOCKET_DATA);
-				lua_pushlstring(L, tmp, r);
-				return 2;
+							}
+						}	
+						lua_pushlightuserdata(L, ptr);
+						lua_pushstring(L, buffer);
+						lua_rawset(L, -3);
+					}
+				} else if (ptr->protocol == PROTOCOL_UDP) {
+					int res = recvfrom(ptr->fd, ptr->buffer, ptr->len, 0, &ptr->remote, sizeof(ptr->remote));
+				} else if (ptr->protocol == PROTOCOL_UDPv6) {
+					int res = recvfrom(ptr->fd, ptr->buffer, ptr->len, 0, &ptr->remote, sizeof(ptr->remote));
+				}
 			}
+			ptr = ptr->next;
 		}
-	} else {
-		lua_pushinteger(L, SOCKET_DATA);
-		lua_pushstring(L, "");
-		return 2;
 	}
-	return 1;
+	lua_pushinteger(L, SOCKET_DATA);
+	lua_gettable(L, -2);
+	return 2;
 }
 
+
+
 static int
-lclose(lua_State *L) {
-	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 1);
-#if WIN32
-	closesocket(so->socket);
-#else
-	close(so->socket);
-#endif // WIN32
-	free_wb_list(so->wl);
-	FREE(so);
-	close_lib(L);
+lclosesocket(lua_State *L) {
+	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
+	int res = colse_sock(g, so);
 	lua_pushinteger(L, SOCKET_EXIT);
 	return 1;
 }
 
 static int
 lkeepalive(lua_State *L) {
-	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 1);
+	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
 	//setsockopt(so->so)
 	return 0;
 }
 
-static int
-ltest1(lua_State *L) {
-	if (lua_type(L, 1) == LUA_TTABLE) {
-		/*if (lua_getfield(L, 1, "vabc")) {
-			printf("%s\n", "abc");
-			if (lua_getfield(L, -1, "mabc")) {
-				const char * str = lua_tostring(L, -1);
-				printf("%s\n", str);
-			} else {
-				printf("%s\n", "falses");
-			}
-		}*/
-		// if (lua_type(L, -1) == LUA_TTABLE) {
-		// 	if (lua_getfield(L, -1, "kabcd")) {
-		// 		const char * str = lua_tostring(L, -1);
-		// 		printf("%s\n", str);
-		// 	} else {
-		// 		printf("%s\n", "falses");
-		// 	}
-
-
-			// lua_pushnil(L);  /* first key */
-   //   		while (lua_next(L, -2) != 0) {
-		 //       /* uses 'key' (at index -2) and 'value' (at index -1) */
-		 //       printf("%s - %s\n",
-		 //              lua_typename(L, lua_type(L, -2)),
-		 //              lua_typename(L, lua_type(L, -1)));
-		 //       /* removes 'value'; keeps 'key' for next iteration */
-		 //       lua_pop(L, 1);
-		 //     }
-
-			// if (lua_getfield(L, -1, "mabc")) {
-			// 	const char * str = lua_tostring(L, -1);
-			// 	printf("%s\n", str);
-			// }
-			// if (lua_getmetatable(L, -1) == 1) {
-			// 	printf("%s\n", "ok");
-			// } else {
-			// 	printf("%s\n", "false");
-			// }
-			// lua_getfield(L, 1, "mabc");
-			// const char *str = lua_tostring(L, -1);
-			// printf("%s\n", str);
-		// }
-		// lua_getfield(L, -1, "test");
-		// lua_pcall(L, 0, 0, 0);
-	}
-	return 0;
-}
-
-// static int 
-// test(lua_State *L) {
-// 	const char * str = lua_tostring(L, lua_upvalueindex(1));
-// 	printf("%s\n", str);
-// 	return 0;
-// }
-
-static int
-ltest2(lua_State *L) {
-	if (lua_type(L, 1) == LUA_TTABLE) {
-		lua_pushstring(L, "vabc");
-
-		lua_newtable(L);
-		lua_pushstring(L, "kkabcd");
-		lua_pushstring(L, "vvabcd");
-		lua_rawset(L, -3);
-
-		// new metatable
-		if (luaL_newmetatable(L, "TTEST")) {
-			// // new table 
-			lua_newtable(L);
-			lua_pushstring(L, "mabc");
-			lua_pushstring(L, "mabcd");
-			lua_rawset(L, -3);
-			lua_setfield(L, -2, "__index");
-		}
-
-		lua_setmetatable(L, -2);
-
-
-		// // new cc
-		// lua_pushcclosure(L, test, 2);
-		// lua_pushstring(L, "uvabc");
-		// lua_setupvalue(L, -2, 1);
-		// lua_pushstring(L, "uvabcd");
-		// lua_setupvalue(L, -2, 2);
-
-		// lua_setfield(L, -2, "test");
-
-
-		// lua_pop(L, 1);
-
-		// if (luaL_getmetatable(L, "test") == 1) {
-		// 	printf("%s\n", "meta ok");
-		// } else {
-		// 	printf("%s\n", "meta false");
-		// }
-		// luaL_setmetatable(L, "test");
-
-
-		lua_rawset(L, 1);
-		lua_pushstring(L, "kabcd");
-		lua_pushstring(L, "vabcd");
-		lua_rawset(L, 1);
-	}
-	return 0;
-}
-
-static int
-ltest3(lua_State *L) {
-	lua_createtable(L, 0, 2);
+static int 
+lclose(lua_State *L) {
+	close_lib()
+	lua_pushinteger(L, SOCKET_EXIT);
 	return 1;
-}
-
-struct packagesocketudp
-{
-	int fd;
-	struct sockaddr local;
-	struct sockaddr remote;
-	char buffer[1024];
-	int len;
-};
-
-static int
-ludp(lua_State *L) {
-	struct packagesocketudp *ps = malloc(sizeof(*ps));
-	ps->fd = 0;
-	memset(&ps->local, 0, sizeof(ps->local));
-	memset(&ps->remote, 0, sizeof(ps->remote));
-	memset(&ps->buffer, 0, 1024);
-	ps->len = 1024;
-
-	int t = luaL_checkinteger(L, 1);
-	if (t == 1) {
-		size_t sz = 0;
-		const char *laddr = luaL_checklstring(L, 2, &sz);
-		int lport = luaL_checkinteger(L, 3);	
-		struct sockaddr_in * local = (struct sockaddr_in *)&ps->local;	
-		(local)->sin_family = AF_INET;
-		(local)->sin_port = htons(lport);	
-		inet_pton(AF_INET, laddr, &local->sin_addr);	
-		
-		const char *raddr = luaL_checklstring(L, 4, &sz);
-		int rport = luaL_checkinteger(L, 5);
-
-		struct sockaddr_in * remote = (struct sockaddr_in *)&ps->remote;
-		(remote)->sin_family = AF_INET;
-		(remote)->sin_port = htons(rport);
-		inet_pton(AF_INET, laddr, &remote->sin_addr);
-
-		int fd = socket(PF_INET, SOCK_DGRAM, 0);
-		ps->fd = fd;
-	} else if (t == 2) {
-		size_t sz = 0;
-		const char *laddr = luaL_checklstring(L, 2, &sz);
-		int lport = luaL_checkinteger(L, 3);
-		struct sockaddr_in6 *local = (struct sockaddr_in6 *)&ps->local;
-		local->sin_family = AF_INET6;
-		local->sin_port = htons(lport);
-		inet_pton(AF_INET6, laddr, &local->sin6_addr)
-		
-	}
-	if strlen(laddr) 
-
-	int r = bind(fd, &ps->local, sizeof(ps->local));
-
-	lua_pushlightuserdata(L, (void*)ps);
-	return 1;
-}
-
-static int
-ludp_connect(lua_State *L) {
-	struct packagesocketudp *ps  = (struct packagesocketudp *)lua_touserdata(L, 1);
-}
-
-static int
-ludp_send(lua_State *L) {
-	struct packagesocketudp *ps  = (struct packagesocketudp *)lua_touserdata(L, 1);
-	size_t sz = 0;
-	const char * buffer = luaL_checklstring(L, 2, &sz);
-	sendto(ps->fd, buffer, sz, 0, &ps->remote, sizeof(ps->remote));
-	return 0;
-}
-
-static int
-ludp_poll(lua_State *L) {
-	struct packagesocketudp *ps  = (struct packagesocketudp *)lua_touserdata(L, 1);
-	int r = recvfrom(ps->fd, ps->buffer, 256, 0, &ps->remote, sizeof(ps->remote));
-	if (r == -1) {
-		if (errno == EAGAIN || errno == EINTR) {
-		}
-		lua_pushinteger(L, r);
-		return 1;
-	} else {
-		lua_pushstring(L, ps->buffer);
-		lua_pushinteger(L, r);
-		return 2;
-	}
-}
-
-ludp_close(lua_State *L) {
-	struct packagesocketudp *ps  = (struct packagesocketudp *)lua_touserdata(L, 1);
-	close(ps->fd);
-	free(ps);
 }
 
 int
 luaopen_packagesocket(lua_State *L) {
 	luaL_Reg l[] = {
 		{ "new", lnew },
+		{ "socket", lsocket },
 		{ "connect", lconnect },
 		{ "send", lsend },
 		{ "poll", lpoll },
+		{ "closesocket", lclosesocket},
 		{ "close", lclose },
 		{ "keepalive", lkeepalive },
-		{ "test1", ltest1 },
-		{ "test2", ltest2 },
-		{ "test3", ltest3 },
-		{ "udp", ludp},
-		{ "udp_send", ludp_send},
-		{ "udp_poll", ludp_poll},
-		{ "udp_close", ludp_close},
 		{ NULL, NULL },
 	};
 	luaL_openlib(L, "packagesocket", l, 0);
@@ -550,5 +496,17 @@ luaopen_packagesocket(lua_State *L) {
 	lua_pushstring(L, "SOCKET_UDP");
 	lua_pushinteger(L, SOCKET_UDP);
 	lua_rawset(L, -3);
+
+	lua_pushinteger(L, HEADER_LINE);
+	lua_setfield(L, -2, "HEADER_LINE");
+	lua_pushinteger(L, HEADER_PG);
+	lua_setfield(L, -2, "HEADER_PG");
+
+	lua_pushinteger(L, PROTOCOL_TCP);
+	lua_setfield(L, -2, "PROTOCOL_TCP");
+	lua_pushinteger(L, PROTOCOL_UDP);
+	lua_setfield(L, -2, "PROTOCOL_UDP");
+	lua_pushinteger(L, -2, PROTOCOL_UDPv6);
+	lua_setfield(L, -2, "PROTOCOL_UDPv6");
 	return 1;
 }
