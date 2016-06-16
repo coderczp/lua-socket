@@ -68,7 +68,7 @@ init_lib() {
 	int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
 	if (iResult != 0) {
 		//lua_error(L);
-		luaL_error(L, "init win32 failture.");
+		//luaL_error(L, "init win32 failture.");
 	}
 #endif // WIN32
 }
@@ -217,8 +217,12 @@ lsocket(lua_State *L) {
 	so->bhead = so->buffer;
 	so->btail = so->buffer;
 	so->next = NULL;
-	g->tail->next = so;
-	g->tail = so;
+	if (g->tail == NULL) {
+		g->tail = so;
+	} else {
+		g->tail->next = so;
+		g->tail = so;
+	}
 	if (g->head == NULL) {
 		g->head = so;
 	}
@@ -274,11 +278,13 @@ send_list(struct lua_socket *so, struct wb_list *list) {
 			if (sz == -1) {
 				#if WIN32 
 				int e = WSAGetLastError();
+				if (e == WSAEINTR || e == WSAEINPROGRESS) {
+					return SOCKET_DATA;
+				}
 				#else
-				// if (errno == EINTR || errno == AGAIN_WOULDBLOCK) {
-				// } else {
-				// 	return SOCKET_ERROR;
-				// }
+				if (errno == EINTR) {
+					return SOCKET_DATA;
+				}
 				#endif
 			} else {
 				if (sz != tmp->sz) {
@@ -292,7 +298,16 @@ send_list(struct lua_socket *so, struct wb_list *list) {
 		} else if (so->protocol == PROTOCOL_UDP) {
 			int sz = sendto(so->fd, tmp->ptr, tmp->sz, 0, &so->remote, sizeof(so->remote));
 			if (sz == -1) {
+#if WIN32
+				int e = WSAGetLastError();
+				if (e == WSAEINTR || e == WSAEINPROGRESS) {
+					return SOCKET_DATA;
+				} else {
+					return SOCKET_ERROR;
+				}
+#else
 
+#endif // WIN32
 			} else {
 				if (sz != tmp->sz) {
 					tmp->ptr += sz;
@@ -420,7 +435,7 @@ lpoll(lua_State *L) {
 	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
 	lua_newtable(L);
 	FD_ZERO(&g->fds);
-	int max = 0;
+	uint32_t max = 0;
 	struct lua_socket *ptr = g->head;
 	while (ptr) {
 		if (ptr->fd > max) 
@@ -442,6 +457,7 @@ lpoll(lua_State *L) {
 					int res = recv(ptr->fd, ptr->btail, ptr->len - (ptr->btail - ptr->buffer + 1), 0);
 					if (res == -1) {
 						// error
+
 					} else if (res == 0) {
 						// 
 						colse_sock(g, ptr);
@@ -499,7 +515,7 @@ lclose(lua_State *L) {
 
 int
 luaopen_packagesocket(lua_State *L) {
-	luaL_checkversion(L);
+	//luaL_checkversion(L);
 	luaL_Reg l[] = {
 		{ "new", lnew },
 		{ "socket", lsocket },
