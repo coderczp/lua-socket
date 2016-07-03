@@ -562,14 +562,19 @@ luaopen_packagesocket(lua_State *L) {
 
 	lua_pushinteger(L, HEADER_LINE);
 	lua_setfield(L, -2, "HEADER_LINE");
+	lua_rawset(L, -3);
 	lua_pushinteger(L, HEADER_PG);
 	lua_setfield(L, -2, "HEADER_PG");
+	lua_rawset(L, -3);
 
 	lua_pushinteger(L, PROTOCOL_TCP);
 	lua_setfield(L, -2, "PROTOCOL_TCP");
+	lua_rawset(L, -3);
 	lua_pushinteger(L, PROTOCOL_UDP);
 	lua_setfield(L, -2, "PROTOCOL_UDP");
+	lua_rawset(L, -3);
 	lua_pushinteger(L, PROTOCOL_UDPv6);
 	lua_setfield(L, -2, "PROTOCOL_UDPv6");
+	lua_rawset(L, -3);
 	return 1;
 }
