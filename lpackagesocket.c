@@ -74,6 +74,24 @@ static int int22bytes_bd(int32_t src, char *bufer, int idx, int len) {
 	return 1;
 }
 
+static int bytes2int_bd(char *src, int len, int32_t *dst) {
+	assert(len == 4);
+	int i = 0;
+	for (; i < len; i++) {
+		*dst |= (src[i] << ((3 - i) * 8)) & 0xffffffff;
+	}
+	return 1;
+}
+
+static int bytes2sint_bd(char *src, int len, int16_t *dst) {
+	assert(len == 2);
+	int i = 0;
+	for (; i < len; i++) {
+		*dst |= (src[i] << ((3 - i) * 8)) & 0xffffffff;
+	}
+	return 1;
+}
+
 static void
 init_lib() {
 #if WIN32
@@ -362,7 +380,7 @@ append_sendbuffer(lua_State *L, struct lua_socket * so, struct write_buffer *wb)
 }
 
 static int
-lsend_request(lua_State *L) {
+lpack_request(lua_State *L) {
 	// struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
 	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
 	assert(so->header == HEADER_PG);
@@ -371,28 +389,16 @@ lsend_request(lua_State *L) {
 	uint32_t session = luaL_checkinteger(L, 4);
 	uint16_t bsz = sz + 4 + 1;
 	char *buffer = (char *)MALLOC(bsz + 2);
-	int22bytes_bd(sz, buffer, 0, 2);
+	int22bytes_bd(bsz+2, buffer, 0, 2);
 	memcpy(buffer + 2, addr, sz);
 	int22bytes_bd(session, buffer, sz + 2, 4);
 	buffer[sz + 6] = c2s_req_tag;
-	int lsz = send_buffer(L, so, buffer, bsz + 2);
-	if (lsz == bsz + 2) {
-		FREE(buffer);
-	} else {
-		struct write_buffer *wb = (struct write_buffer *)MALLOC(sizeof(*wb));
-		wb->buffer = buffer;
-		wb->ptr = buffer + lsz;
-		wb->sz = sz + 2 - lsz;
-		wb->next = NULL;
-		wb->userobject = false;
-		append_sendbuffer(L, so, wb);
-	}
-	lua_pushinteger(L, SOCKET_DATA);
+	lua_pushlstring(L, buffer, bsz + 2);
 	return 1;
 }
 
 static int
-lsend_response(lua_State *L) {
+lpack_response(lua_State *L) {
 	// struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
 	struct lua_socket * so = (struct lua_socket*)lua_touserdata(L, 2);
 	assert(so->header == HEADER_PG);
@@ -401,23 +407,11 @@ lsend_response(lua_State *L) {
 	uint32_t session = luaL_checkinteger(L, 4);
 	uint16_t bsz = sz + 4 + 1;
 	char *buffer = (char *)MALLOC(bsz + 2);
-	int22bytes_bd(bsz, buffer, 0, 2);
+	int22bytes_bd(bsz+2, buffer, 0, 2);
 	memcpy(buffer + 2, addr, sz);
 	int22bytes_bd(session, buffer, sz + 2, 4);
 	buffer[sz + 6] = s2c_rsp_tag;
-	int lsz = send_buffer(L, so, buffer, bsz + 2);
-	if (lsz == bsz + 2) {
-		FREE(buffer);
-	} else {
-		struct write_buffer *wb = (struct write_buffer *)MALLOC(sizeof(*wb));
-		wb->buffer = buffer;
-		wb->ptr = buffer + lsz;
-		wb->sz = sz + 2 - lsz;
-		wb->next = NULL;
-		wb->userobject = false;
-		append_sendbuffer(L, so, wb);
-	}
-	lua_pushinteger(L, SOCKET_DATA);
+	lua_pushlstring(L, buffer, bsz + 2);
 	return 1;
 }
 
@@ -632,8 +626,8 @@ luaopen_packagesocket(lua_State *L) {
 		{ "new", lnew },
 		{ "socket", lsocket },
 		{ "connect", lconnect },
-		{ "send_request", lsend_request },
-		{ "send_response", lsend_response },
+		{ "pack_request", lpack_request },
+		{ "pack_response", lpack_response },
 		{ "send", lsend },
 		{ "sendline", lsendline},
 		{ "poll", lpoll },
