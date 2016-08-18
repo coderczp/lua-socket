@@ -83,7 +83,7 @@ static int bytes2int_bd(char *src, int len, int32_t *dst) {
 	return 1;
 }
 
-static int bytes2sint_bd(char *src, int len, int16_t *dst) {
+static int bytes2sint_bd(char *src, int len, uint16_t *dst) {
 	assert(len == 2);
 	int i = 0;
 	for (; i < len; i++) {
@@ -178,7 +178,7 @@ typedef struct lua_gate {
 
 
 static int
-colse_sock(struct lua_gate *g, struct lua_socket *so) {
+colse_sock(lua_State *L, struct lua_gate *g, struct lua_socket *so) {
 	struct lua_socket *ptr = g->head;
 	while (ptr) {
 		if (ptr == so) {
@@ -195,6 +195,7 @@ colse_sock(struct lua_gate *g, struct lua_socket *so) {
 	close(so->fd);
 #endif // WIN32
 	FREE(so);
+	lua_pushinteger(L, SOCKET_EXIT);
 	return 1;
 }
 
@@ -389,7 +390,7 @@ lpack_request(lua_State *L) {
 	uint32_t session = luaL_checkinteger(L, 4);
 	uint16_t bsz = sz + 4 + 1;
 	char *buffer = (char *)MALLOC(bsz + 2);
-	int22bytes_bd(bsz+2, buffer, 0, 2);
+	int22bytes_bd(bsz + 2, buffer, 0, 2);
 	memcpy(buffer + 2, addr, sz);
 	int22bytes_bd(session, buffer, sz + 2, 4);
 	buffer[sz + 6] = c2s_req_tag;
@@ -407,7 +408,7 @@ lpack_response(lua_State *L) {
 	uint32_t session = luaL_checkinteger(L, 4);
 	uint16_t bsz = sz + 4 + 1;
 	char *buffer = (char *)MALLOC(bsz + 2);
-	int22bytes_bd(bsz+2, buffer, 0, 2);
+	int22bytes_bd(bsz + 2, buffer, 0, 2);
 	memcpy(buffer + 2, addr, sz);
 	int22bytes_bd(session, buffer, sz + 2, 4);
 	buffer[sz + 6] = s2c_rsp_tag;
@@ -468,7 +469,7 @@ lsendline(lua_State *L) {
 }
 
 static int
-parse(lua_State *L, struct lua_gate *g, struct lua_socket *so, char *buffer, int sz) {
+lunpack(lua_State *L, struct lua_gate *g, struct lua_socket *so, char *buffer, int sz) {
 	lua_pushstring(L, "data");
 	lua_pushlstring(L, buffer, sz - 5);
 	lua_rawset(L, -3);
@@ -495,32 +496,36 @@ parse(lua_State *L, struct lua_gate *g, struct lua_socket *so, char *buffer, int
 static int
 readc(lua_State *L, struct lua_gate *g, struct lua_socket *so) {
 	if (so->bhead == so->btail) {
+		// 本应该设计成扩大接受区的
+		lua_pushinteger(L, SOCKET_ERROR);
 		return 1;
 	}
 	if (so->header == HEADER_PG) {
-		int h = so->bhead[0];
-		h = h & so->bhead[1] << 8;
-		if (so->btail - so->bhead >= h + 2) {
-			lua_pushlightuserdata(L, so);
-			lua_newtable(L);
-			parse(L, g, so, so->bhead + 2, h);
-			lua_rawset(L, -3);
-			so->bhead = so->bhead + h + 2;
+		uint16_t sz;
+		bytes2sint_bd(so->bhead, 2, &sz);
+		if (so->btail - so->bhead >= sz + 2) {
+			lua_pushinteger(L, SOCKET_DATA);
+			lua_pushlstring(L, so->bhead + 2, sz);
+			so->bhead = so->bhead + sz + 2;
+			return 2;
+		} else {
+			lua_pushinteger(L, SOCKET_DATA);
+			return 1;
 		}
 	} else if (so->header == HEADER_LINE) {
 		char *p = so->bhead;
 		while (p != so->btail) {
 			if ((*p) == '\n') {
-				lua_pushlightuserdata(L, so);
+				lua_pushinteger(L, SOCKET_DATA);
 				lua_pushlstring(L, so->bhead, p - so->bhead);
-				lua_rawset(L, -3);
 				so->bhead = p + 1;
-				return 1;
+				return 2;
 			} else {
 				p++;
 			}
 		}
 	}
+	lua_pushinteger(L, SOCKET_ERROR);
 	return 1;
 }
 
@@ -536,63 +541,72 @@ rebase(lua_State *L, struct lua_gate *g, struct lua_socket *so) {
 }
 
 static int
-lpoll(lua_State *L) {
-	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
-	lua_newtable(L);
-	FD_ZERO(&g->fds);
-	uint32_t max = 0;
+poll(lua_State *L, struct lua_gate *g, struct lua_socket *so) {
 	struct lua_socket *ptr = g->head;
-	while (ptr) {
-		if (ptr->fd > max)
-			max = ptr->fd;
-		FD_SET(ptr->fd, &g->fds);
-		ptr = ptr->next;
-	}
-	struct timeval timeout;
-	timeout.tv_sec = 0;
-	timeout.tv_usec = 0;
-	int r = select(max + 1, &g->fds, NULL, NULL, &timeout);
-	if (r > 0) {
-		ptr = g->head;
-		while (ptr) {
-			send_list(L, ptr, ptr->wl);
-			if (FD_ISSET(ptr->fd, &g->fds)) {
-				rebase(L, g, ptr);
-				if (ptr->protocol == PROTOCOL_TCP) {
-					int len = ptr->len - (ptr->btail - ptr->buffer + 1);
-					int res = recv(ptr->fd, ptr->btail, len, 0);
-					if (res == -1) {
-						// error
-
-					} else if (res == 0) {
-						// 
-						colse_sock(g, ptr);
-					} else if (res > 0) {
-						ptr->btail = ptr->btail + res;
-						readc(L, g, ptr);
-					}
-				} else if (ptr->protocol == PROTOCOL_UDP) {
-					socklen_t len = sizeof(ptr->remote);
-					int res = recvfrom(ptr->fd, ptr->btail, ptr->len - (ptr->btail - ptr->buffer + 1), 0, &ptr->remote, &len);
-					if (res > 0) {
-						ptr->btail = ptr->btail + res;
-						readc(L, g, ptr);
-					}
-				} else if (ptr->protocol == PROTOCOL_UDPv6) {
-					socklen_t len = sizeof(ptr->remote);
-					int res = recvfrom(ptr->fd, ptr->btail, ptr->len - (ptr->btail - ptr->buffer + 1), 0, &ptr->remote, &len);
-					if (res > 0) {
-						ptr->btail = ptr->btail + res;
-						readc(L, g, ptr);
-					}
-				}
-			}
+	while (true) {
+		if (ptr == NULL) {
+			lua_pushinteger(L, SOCKET_ERROR);
+			return 1;
+		} else  if (ptr == so) {
+			break;
+		} else {
 			ptr = ptr->next;
 		}
 	}
-	lua_pushinteger(L, SOCKET_DATA);
-	lua_insert(L, -2);
-	return 2;
+	uint32_t max = 0;
+	max = so->fd;
+	struct timeval timeout;
+	timeout.tv_sec = 0;
+	timeout.tv_usec = 0;
+	FD_ZERO(&g->fds);
+	FD_SET(ptr->fd, &g->fds);
+	int r = select(max + 1, &g->fds, NULL, NULL, &timeout);
+	if (r > 0) {
+		send_list(L, ptr, ptr->wl);
+		if (FD_ISSET(ptr->fd, &g->fds)) {
+			rebase(L, g, ptr);
+			if (ptr->protocol == PROTOCOL_TCP) {
+				int len = ptr->len - (ptr->btail - ptr->buffer + 1);
+				int res = recv(ptr->fd, ptr->btail, len, 0);
+				if (res == -1) {
+					// error
+				} else if (res == 0) {
+					// 
+					return colse_sock(L, g, ptr);
+				} else if (res > 0) {
+					ptr->btail = ptr->btail + res;
+					return readc(L, g, ptr);
+				}
+			} else if (ptr->protocol == PROTOCOL_UDP) {
+				socklen_t len = sizeof(ptr->remote);
+				int res = recvfrom(ptr->fd, ptr->btail, ptr->len - (ptr->btail - ptr->buffer + 1), 0, &ptr->remote, &len);
+				if (res > 0) {
+					ptr->btail = ptr->btail + res;
+					return readc(L, g, ptr);
+				}
+			} else if (ptr->protocol == PROTOCOL_UDPv6) {
+				socklen_t len = sizeof(ptr->remote);
+				int res = recvfrom(ptr->fd, ptr->btail, ptr->len - (ptr->btail - ptr->buffer + 1), 0, &ptr->remote, &len);
+				if (res > 0) {
+					ptr->btail = ptr->btail + res;
+					return readc(L, g, ptr);
+				}
+			}
+		}
+	} else {
+	}
+}
+
+static int
+lpoll(lua_State *L) {
+	struct lua_gate *g = (struct lua_gate *)lua_touserdata(L, 1);
+	struct lua_socket *so = (struct lua_socket *)lua_touserdata(L, 2);
+	if (so != NULL) {
+		return poll(L, g, so);
+	} else {
+		lua_pushinteger(L, SOCKET_ERROR);
+		return 1;
+	}
 }
 
 static int
@@ -628,6 +642,7 @@ luaopen_packagesocket(lua_State *L) {
 		{ "connect", lconnect },
 		{ "pack_request", lpack_request },
 		{ "pack_response", lpack_response },
+		{ "unpack", lunpack},
 		{ "send", lsend },
 		{ "sendline", lsendline},
 		{ "poll", lpoll },
