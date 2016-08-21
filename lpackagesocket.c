@@ -86,8 +86,8 @@ static int bytes2int_bd(char *src, int len, int32_t *dst) {
 static int bytes2sint_bd(char *src, int len, uint16_t *dst) {
 	assert(len == 2);
 	int i = 0;
-	for (; i < len; i++) {
-		*dst |= (src[i] << ((3 - i) * 8)) & 0xffffffff;
+	for (; i < 2; i++) {
+		*dst |= (src[i] << ((1 - i) * 8)) & 0xffffffff;
 	}
 	return 1;
 }
@@ -501,7 +501,7 @@ readc(lua_State *L, struct lua_gate *g, struct lua_socket *so) {
 		return 1;
 	}
 	if (so->header == HEADER_PG) {
-		uint16_t sz;
+		uint16_t sz = 0;
 		bytes2sint_bd(so->bhead, 2, &sz);
 		if (so->btail - so->bhead >= sz + 2) {
 			lua_pushinteger(L, SOCKET_DATA);
